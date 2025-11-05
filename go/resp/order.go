@@ -27,4 +27,5 @@ type SpotOrder struct {
 	AutoRepay    bool   `json:"auto_repay,omitempty"`
 	AutoBorrow   bool   `json:"auto_borrow,omitempty"`
 	Succeeded    bool   `json:"succeeded"`
+	Label        string `json:"label"`
 }

@@ -26,4 +26,5 @@ type FutureOrder struct {
 	IsLiq        bool    `json:"is_liq,omitempty"`
 	IsReduceOnly bool    `json:"is_reduce_only,omitempty"`
 	ReduceOnly   bool    `json:"reduce_only,omitempty"`
+	Label        string  `json:"label"`
 }
