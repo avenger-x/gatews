@@ -21,7 +21,7 @@ type UpdateMsg struct {
 			Message string `json:"message"`
 		} `json:"errs"`
 	} `json:"data"`
-	RequestId string `json:"requestId"`
+	RequestId string `json:"request_id"`
 	Ack       bool   `json:"ack"`
 }
 
