@@ -335,6 +335,10 @@ func (ws *WsService) keepAlive() {
 			<-ticker.C
 			if time.Since(lastResponse) > 30*time.Second {
 				ws.Logger.Printf("ping timeout, should reconnect")
+				err = ws.reconnect()
+				if err != nil {
+					ws.Logger.Printf("reconnect err:%s", err.Error())
+				}
 			}
 		}
 	}()
