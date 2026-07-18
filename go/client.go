@@ -180,14 +180,19 @@ func (ws *WsService) GetConnConf() *ConnConf {
 	return ws.conf
 }
 
-func (ws *WsService) reconnect() error {
+func (ws *WsService) reconnect(oldConn ...*websocket.Conn) error {
+	ws.clientMu.Lock()
+	defer ws.clientMu.Unlock()
+
+	// Another goroutine may have already replaced the connection that failed.
+	if len(oldConn) > 0 && oldConn[0] != nil && ws.Client != oldConn[0] {
+		return nil
+	}
+
 	// avoid repeated reconnection
 	if ws.status == reconnecting {
 		return nil
 	}
-
-	ws.clientMu.Lock()
-	defer ws.clientMu.Unlock()
 
 	if ws.Client != nil {
 		ws.Client.Close()
@@ -310,6 +315,9 @@ func (ws *WsService) GetChannels() []string {
 }
 
 func (ws *WsService) GetConnection() *websocket.Conn {
+	ws.clientMu.Lock()
+	defer ws.clientMu.Unlock()
+
 	return ws.Client
 }
 
@@ -318,16 +326,23 @@ func (ws *WsService) keepAlive() {
 	ticker := time.NewTicker(timeout)
 
 	lastResponse := time.Now()
-	ws.Client.SetPongHandler(func(msg string) error {
-		lastResponse = time.Now()
-		return nil
-	})
+	setPongHandler := func(conn *websocket.Conn) {
+		if conn == nil {
+			return
+		}
+		conn.SetPongHandler(func(msg string) error {
+			lastResponse = time.Now()
+			return nil
+		})
+	}
+	setPongHandler(ws.GetConnection())
 
 	go func() {
 		defer ticker.Stop()
 		for {
+			conn := ws.GetConnection()
 			ws.mu.Lock()
-			err := ws.Client.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second))
+			err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second))
 			ws.mu.Unlock()
 			if err != nil {
 				ws.Logger.Printf("send ping err:%s", err.Error())
@@ -335,9 +350,12 @@ func (ws *WsService) keepAlive() {
 			<-ticker.C
 			if time.Since(lastResponse) > 30*time.Second {
 				ws.Logger.Printf("ping timeout, should reconnect")
-				err = ws.reconnect()
+				err = ws.reconnect(conn)
 				if err != nil {
 					ws.Logger.Printf("reconnect err:%s", err.Error())
+				} else {
+					setPongHandler(ws.GetConnection())
+					lastResponse = time.Now()
 				}
 			}
 		}

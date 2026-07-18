@@ -134,7 +134,7 @@ func (ws *WsService) baseSubscribe(event, channel string, payload any, op *Subsc
 func (ws *WsService) readMsg() {
 	ws.once.Do(func() {
 		go func() {
-			defer ws.Client.Close()
+			defer ws.GetConnection().Close()
 
 			for {
 				select {
@@ -143,11 +143,12 @@ func (ws *WsService) readMsg() {
 					return
 
 				default:
-					_, rawMsg, err := ws.Client.ReadMessage()
+					conn := ws.GetConnection()
+					_, rawMsg, err := conn.ReadMessage()
 					if err != nil {
 						ws.Logger.Printf("websocket err: %s", err.Error())
-						if e := ws.reconnect(); e != nil {
-							ws.Logger.Printf("reconnect err:%s", err.Error())
+						if e := ws.reconnect(conn); e != nil {
+							ws.Logger.Printf("reconnect err:%s", e.Error())
 							return
 						}
 						ws.Logger.Println("reconnect success, continue read message")
