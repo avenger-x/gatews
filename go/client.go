@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -40,6 +41,7 @@ type ConnConf struct {
 	App              string
 	subscribeMsg     *sync.Map
 	URL              string
+	Header           http.Header
 	Key              string
 	Secret           string
 	MaxRetryConn     int
@@ -51,6 +53,7 @@ type ConnConf struct {
 type ConfOptions struct {
 	App              string
 	URL              string
+	Header           http.Header
 	Key              string
 	Secret           string
 	MaxRetryConn     int
@@ -78,11 +81,11 @@ func NewWsService(ctx context.Context, logger *log.Logger, conf *ConnConf) (*WsS
 	retry := 0
 	var conn *websocket.Conn
 	for !stop {
-		dialer := websocket.DefaultDialer
+		dialer := *websocket.DefaultDialer
 		if conf.SkipTlsVerify {
 			dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 		}
-		c, _, err := dialer.Dial(conf.URL, nil)
+		c, _, err := dialer.Dial(conf.URL, conf.Header)
 		if err != nil {
 			if retry >= conf.MaxRetryConn {
 				log.Printf("max reconnect time %d reached, give it up", conf.MaxRetryConn)
@@ -143,6 +146,12 @@ func applyOptionConf(defaultConf, userConf *ConnConf) *ConnConf {
 	if userConf.URL == "" {
 		userConf.URL = defaultConf.URL
 	}
+	if userConf.Header == nil {
+		userConf.Header = defaultConf.Header
+	}
+	if userConf.subscribeMsg == nil {
+		userConf.subscribeMsg = new(sync.Map)
+	}
 
 	if userConf.MaxRetryConn == 0 {
 		userConf.MaxRetryConn = defaultConf.MaxRetryConn
@@ -170,6 +179,7 @@ func NewConnConfFromOption(op *ConfOptions) *ConnConf {
 		Key:              op.Key,
 		Secret:           op.Secret,
 		URL:              op.URL,
+		Header:           op.Header,
 		SkipTlsVerify:    op.SkipTlsVerify,
 		ShowReconnectMsg: op.ShowReconnectMsg,
 		PingInterval:     op.PingInterval,
@@ -203,7 +213,11 @@ func (ws *WsService) reconnect(oldConn ...*websocket.Conn) error {
 	stop := false
 	retry := 0
 	for !stop {
-		c, _, err := websocket.DefaultDialer.Dial(ws.conf.URL, nil)
+		dialer := *websocket.DefaultDialer
+		if ws.conf.SkipTlsVerify {
+			dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		}
+		c, _, err := dialer.Dial(ws.conf.URL, ws.conf.Header)
 		if err != nil {
 			if retry >= ws.conf.MaxRetryConn {
 				ws.Logger.Printf("max reconnect time %d reached, give it up", ws.conf.MaxRetryConn)

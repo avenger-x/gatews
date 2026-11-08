@@ -104,6 +104,31 @@ func main() {
 
 We provide some demo applications in the [examples](_examples) directory, which can be run directly.
 
+## Custom Handshake Headers
+
+Headers configured through `ConfOptions` or `ConnConf` are sent on both the
+initial connection and every reconnect. Leaving `Header` nil keeps the default
+handshake behavior.
+
+```go
+conf := gate.NewConnConfFromOption(&gate.ConfOptions{
+	App: "futures",
+	URL: gate.FuturesUsdtUrl,
+	Header: http.Header{
+		"X-Gate-Size-Decimal": []string{"1"},
+	},
+})
+ws, err := gate.NewWsService(ctx, logger, conf)
+```
+
+Import `net/http` to construct the headers.
+
+## Tests
+
+Run `go test ./...` from this directory for local tests. The existing live
+exchange tests require `go test -tags integration ./...`; some wait for a signal
+or stream data for an extended period and are intended to be run manually.
+
 ## ChangeLog
 
 [changelog](changelog.md)
