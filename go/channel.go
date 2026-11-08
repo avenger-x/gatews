@@ -23,13 +23,12 @@ func (ws *WsService) Subscribe(channel string, payload []string) error {
 		return newAuthEmptyErr()
 	}
 
-	msgCh, ok := ws.msgChs.Load(channel)
-	if !ok {
-		msgCh = make(chan *UpdateMsg, 1)
-		go ws.receiveCallMsg(channel, msgCh.(chan *UpdateMsg))
+	msgCh, err := ws.messageChannel(channel)
+	if err != nil {
+		return err
 	}
 
-	return ws.newBaseChannel(channel, payload, msgCh.(chan *UpdateMsg), nil)
+	return ws.newBaseChannel(channel, payload, msgCh, nil)
 }
 
 func (ws *WsService) SubscribeWithOption(channel string, payload any, op *SubscribeOptions) error {
@@ -37,13 +36,24 @@ func (ws *WsService) SubscribeWithOption(channel string, payload any, op *Subscr
 		return newAuthEmptyErr()
 	}
 
-	msgCh, ok := ws.msgChs.Load(channel)
-	if !ok {
-		msgCh = make(chan *UpdateMsg, 1)
-		go ws.receiveCallMsg(channel, msgCh.(chan *UpdateMsg))
+	msgCh, err := ws.messageChannel(channel)
+	if err != nil {
+		return err
 	}
 
-	return ws.newBaseChannel(channel, payload, msgCh.(chan *UpdateMsg), op)
+	return ws.newBaseChannel(channel, payload, msgCh, op)
+}
+
+func (ws *WsService) messageChannel(channel string) (chan *UpdateMsg, error) {
+	if err := ws.Ctx.Err(); err != nil {
+		return nil, err
+	}
+	msgCh, loaded := ws.msgChs.LoadOrStore(channel, make(chan *UpdateMsg, 1))
+	ch := msgCh.(chan *UpdateMsg)
+	if !loaded && !ws.startWorker(func() { ws.receiveCallMsg(channel, ch) }) {
+		return nil, ws.Ctx.Err()
+	}
+	return ch, nil
 }
 
 func (ws *WsService) UnSubscribe(channel string, payload []string) error {
@@ -93,7 +103,10 @@ func (ws *WsService) baseSubscribe(event, channel string, payload any, op *Subsc
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 
-	err = ws.Client.WriteMessage(websocket.TextMessage, byteReq)
+	if err := ws.Ctx.Err(); err != nil {
+		return err
+	}
+	err = ws.GetConnection().WriteMessage(websocket.TextMessage, byteReq)
 	if err != nil {
 		ws.Logger.Printf("wsWrite [%s] err:%s", channel, err.Error())
 		return err
@@ -133,8 +146,8 @@ func (ws *WsService) baseSubscribe(event, channel string, payload any, op *Subsc
 // readMsg only run once to read message
 func (ws *WsService) readMsg() {
 	ws.once.Do(func() {
-		go func() {
-			defer ws.GetConnection().Close()
+		ws.startWorker(func() {
+			defer ws.shutdown()
 
 			for {
 				select {
@@ -146,6 +159,9 @@ func (ws *WsService) readMsg() {
 					conn := ws.GetConnection()
 					_, rawMsg, err := conn.ReadMessage()
 					if err != nil {
+						if ws.Ctx.Err() != nil {
+							return
+						}
 						ws.Logger.Printf("websocket err: %s", err.Error())
 						if e := ws.reconnect(conn); e != nil {
 							ws.Logger.Printf("reconnect err:%s", e.Error())
@@ -170,15 +186,12 @@ func (ws *WsService) readMsg() {
 						select {
 						case <-ws.Ctx.Done():
 							return
-						default:
-							if _, ok := ws.msgChs.Load(channel); ok {
-								bch.(chan *UpdateMsg) <- &msg
-							}
+						case bch.(chan *UpdateMsg) <- &msg:
 						}
 					}
 				}
 			}
-		}()
+		})
 	})
 }
 
@@ -204,6 +217,9 @@ func (ws *WsService) receiveCallMsg(channel string, msgCh chan *UpdateMsg) {
 			ws.Logger.Printf("received parent context exit")
 			return
 		case msg := <-msgCh:
+			if ws.Ctx.Err() != nil {
+				return
+			}
 			if call, ok := ws.calls.Load(channel); ok {
 				call.(CallBack)(msg)
 			}
@@ -225,14 +241,8 @@ func (ws *WsService) APIRequest(channel string, payload any, keyVals map[string]
 		return newAuthEmptyErr()
 	}
 
-	msgCh, ok := ws.msgChs.Load(channel)
-	if !ok {
-		msgCh = make(chan *UpdateMsg, 1)
-		go ws.receiveCallMsg(channel, msgCh.(chan *UpdateMsg))
-	}
-
-	if _, ok := ws.msgChs.Load(channel); !ok {
-		ws.msgChs.Store(channel, msgCh)
+	if _, err := ws.messageChannel(channel); err != nil {
+		return err
 	}
 
 	ws.readMsg()
@@ -248,14 +258,8 @@ func (ws *WsService) login() error {
 	if ws.conf.App == "futures" {
 		channel = ChannelFutureLogin
 	}
-	msgCh, ok := ws.msgChs.Load(channel)
-	if !ok {
-		msgCh = make(chan *UpdateMsg, 1)
-		go ws.receiveCallMsg(channel, msgCh.(chan *UpdateMsg))
-	}
-
-	if _, ok := ws.msgChs.Load(channel); !ok {
-		ws.msgChs.Store(channel, msgCh)
+	if _, err := ws.messageChannel(channel); err != nil {
+		return err
 	}
 
 	ws.readMsg()
@@ -279,7 +283,10 @@ func (ws *WsService) apiRequest(channel string, payload any, keyVals map[string]
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 
-	return ws.Client.WriteMessage(websocket.TextMessage, byteReq)
+	if err := ws.Ctx.Err(); err != nil {
+		return err
+	}
+	return ws.GetConnection().WriteMessage(websocket.TextMessage, byteReq)
 }
 
 func (ws *WsService) generateAPIRequest(channel string, placeParam any, keyVals map[string]any) any {

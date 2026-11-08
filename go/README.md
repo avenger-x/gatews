@@ -123,6 +123,28 @@ ws, err := gate.NewWsService(ctx, logger, conf)
 
 Import `net/http` to construct the headers.
 
+## Shutdown
+
+Initial connections, reconnects, and retry waits honor the context passed to
+`NewWsService`. Canceling it closes the active connection and stops heartbeats,
+message reads, and callback workers. `Close()` also cancels the service and waits
+for its background work to finish; concurrent or repeated calls are safe. A
+closed service cannot reconnect or create new subscriptions.
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+ws, err := gate.NewWsService(ctx, logger, conf)
+if err != nil {
+	return err
+}
+defer ws.Close()
+```
+
+Callbacks run synchronously on SDK workers. They must return before `Close()`
+can finish, so call `Close()` from outside a callback (or launch it in a separate
+goroutine). `PingInterval` controls the heartbeat interval, defaulting to `10s`.
+
 ## Tests
 
 Run `go test ./...` from this directory for local tests. The existing live

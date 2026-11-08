@@ -95,7 +95,7 @@ func TestHandshakeHeaderInitialAndReconnect(t *testing.T) {
 			if err != nil {
 				t.Fatalf("initial connection: %v", err)
 			}
-			defer func() { ws.GetConnection().Close() }()
+			defer ws.Close()
 
 			for attempt := 0; attempt < 2; attempt++ {
 				if attempt > 0 {

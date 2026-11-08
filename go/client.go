@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	mapset "github.com/deckarep/golang-set"
@@ -23,17 +25,23 @@ const (
 )
 
 type WsService struct {
-	mu        *sync.Mutex
-	Logger    *log.Logger
-	Ctx       context.Context
-	Client    *websocket.Conn
-	once      *sync.Once
-	loginOnce *sync.Once
-	msgChs    *sync.Map // business chan
-	calls     *sync.Map
-	conf      *ConnConf
-	status    status
-	clientMu  *sync.Mutex
+	lastPong    int64 // Keep 64-bit atomic state aligned on 32-bit platforms.
+	mu          *sync.Mutex
+	Logger      *log.Logger
+	Ctx         context.Context
+	Client      *websocket.Conn
+	once        *sync.Once
+	loginOnce   *sync.Once
+	msgChs      *sync.Map // business chan
+	calls       *sync.Map
+	conf        *ConnConf
+	status      status
+	clientMu    *sync.Mutex
+	reconnectMu sync.Mutex
+	cancel      context.CancelFunc
+	closeOnce   sync.Once
+	workers     sync.WaitGroup
+	closed      bool
 }
 
 // ConnConf default URL is spot websocket
@@ -77,34 +85,12 @@ func NewWsService(ctx context.Context, logger *log.Logger, conf *ConnConf) (*WsS
 		conf = defaultConf
 	}
 
-	stop := false
-	retry := 0
-	var conn *websocket.Conn
-	for !stop {
-		dialer := *websocket.DefaultDialer
-		if conf.SkipTlsVerify {
-			dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-		}
-		c, _, err := dialer.Dial(conf.URL, conf.Header)
-		if err != nil {
-			if retry >= conf.MaxRetryConn {
-				log.Printf("max reconnect time %d reached, give it up", conf.MaxRetryConn)
-				return nil, err
-			}
-			retry++
-			log.Printf("failed to connect to server for the %d time, try again later", retry)
-			time.Sleep(time.Millisecond * (time.Duration(retry) * 500))
-			continue
-		} else {
-			stop = true
-			conn = c
-		}
+	ctx, cancel := context.WithCancel(ctx)
+	conn, err := connect(ctx, logger, conf)
+	if err != nil {
+		cancel()
+		return nil, err
 	}
-
-	if retry > 0 {
-		log.Printf("reconnect succeeded after retrying %d times", retry)
-	}
-
 	ws := &WsService{
 		mu:        new(sync.Mutex),
 		conf:      conf,
@@ -117,11 +103,150 @@ func NewWsService(ctx context.Context, logger *log.Logger, conf *ConnConf) (*WsS
 		loginOnce: new(sync.Once),
 		status:    connected,
 		clientMu:  new(sync.Mutex),
+		cancel:    cancel,
 	}
-
-	ws.keepAlive()
+	ws.prepareConnection(conn)
+	ws.workers.Add(2)
+	go func() {
+		defer ws.workers.Done()
+		<-ctx.Done()
+		ws.shutdown()
+	}()
+	go func() {
+		defer ws.workers.Done()
+		ws.keepAlive()
+	}()
 
 	return ws, nil
+}
+
+func connect(ctx context.Context, logger *log.Logger, conf *ConnConf) (*websocket.Conn, error) {
+	for retry := 0; ; retry++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		conn, err := dialConnection(ctx, conf)
+		if err == nil {
+			return conn, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if retry >= conf.MaxRetryConn {
+			return nil, err
+		}
+		logger.Printf("failed to connect to server for the %d time, try again later", retry+1)
+		timer := time.NewTimer(time.Duration(retry+1) * 500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func dialConnection(ctx context.Context, conf *ConnConf) (*websocket.Conn, error) {
+	dialer := *websocket.DefaultDialer
+	if conf.SkipTlsVerify {
+		dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	netDial := dialer.NetDialContext
+	if netDial == nil {
+		if dialer.NetDial != nil {
+			netDial = func(_ context.Context, network, addr string) (net.Conn, error) {
+				return dialer.NetDial(network, addr)
+			}
+		} else {
+			netDial = (&net.Dialer{}).DialContext
+		}
+	}
+
+	// Gorilla v1.4.2 does not interrupt an in-flight handshake on cancellation.
+	pending := make(chan net.Conn, 1)
+	finished := make(chan struct{})
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		select {
+		case conn := <-pending:
+			select {
+			case <-ctx.Done():
+				conn.Close()
+			case <-finished:
+			}
+		case <-finished:
+		}
+	}()
+	dialer.NetDialContext = func(dialCtx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := netDial(dialCtx, network, addr)
+		if err == nil {
+			pending <- conn
+		}
+		return conn, err
+	}
+	conn, _, err := dialer.DialContext(ctx, conf.URL, conf.Header)
+	close(finished)
+	<-watchDone
+	if ctx.Err() != nil {
+		if conn != nil {
+			conn.Close()
+		}
+		return nil, ctx.Err()
+	}
+	return conn, err
+}
+
+// Close cancels all work and waits for SDK goroutines to exit. It is safe to call
+// concurrently or repeatedly. Callbacks must return before Close can complete;
+// do not call Close synchronously from a callback.
+func (ws *WsService) Close() error {
+	ws.shutdown()
+	ws.workers.Wait()
+	return nil
+}
+
+func (ws *WsService) shutdown() {
+	ws.closeOnce.Do(func() {
+		ws.cancel()
+		ws.clientMu.Lock()
+		ws.closed = true
+		ws.status = disconnected
+		conn := ws.Client
+		ws.clientMu.Unlock()
+		if conn != nil {
+			conn.Close()
+		}
+	})
+}
+
+func (ws *WsService) beginWork() bool {
+	ws.clientMu.Lock()
+	defer ws.clientMu.Unlock()
+	if ws.closed || ws.Ctx.Err() != nil {
+		return false
+	}
+	ws.workers.Add(1)
+	return true
+}
+
+func (ws *WsService) startWorker(f func()) bool {
+	if !ws.beginWork() {
+		return false
+	}
+	go func() {
+		defer ws.workers.Done()
+		f()
+	}()
+	return true
+}
+
+func (ws *WsService) prepareConnection(conn *websocket.Conn) {
+	atomic.StoreInt64(&ws.lastPong, time.Now().UnixNano())
+	conn.SetPongHandler(func(string) error {
+		atomic.StoreInt64(&ws.lastPong, time.Now().UnixNano())
+		return nil
+	})
 }
 
 func getInitConnConf() *ConnConf {
@@ -191,63 +316,64 @@ func (ws *WsService) GetConnConf() *ConnConf {
 }
 
 func (ws *WsService) reconnect(oldConn ...*websocket.Conn) error {
+	if !ws.beginWork() {
+		return ws.Ctx.Err()
+	}
+	defer ws.workers.Done()
+	ws.reconnectMu.Lock()
+	defer ws.reconnectMu.Unlock()
+	if err := ws.Ctx.Err(); err != nil {
+		return err
+	}
 	ws.clientMu.Lock()
-	defer ws.clientMu.Unlock()
+	if ws.Ctx.Err() != nil || ws.closed {
+		ws.clientMu.Unlock()
+		return ws.Ctx.Err()
+	}
 
 	// Another goroutine may have already replaced the connection that failed.
 	if len(oldConn) > 0 && oldConn[0] != nil && ws.Client != oldConn[0] {
+		ws.clientMu.Unlock()
 		return nil
 	}
-
-	// avoid repeated reconnection
-	if ws.status == reconnecting {
-		return nil
-	}
-
-	if ws.Client != nil {
-		ws.Client.Close()
-	}
-
+	previous := ws.Client
 	ws.status = reconnecting
-
-	stop := false
-	retry := 0
-	for !stop {
-		dialer := *websocket.DefaultDialer
-		if ws.conf.SkipTlsVerify {
-			dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-		}
-		c, _, err := dialer.Dial(ws.conf.URL, ws.conf.Header)
-		if err != nil {
-			if retry >= ws.conf.MaxRetryConn {
-				ws.Logger.Printf("max reconnect time %d reached, give it up", ws.conf.MaxRetryConn)
-				return err
-			}
-			retry++
-			log.Printf("failed to connect to server for the %d time, try again later", retry)
-			time.Sleep(time.Millisecond * (time.Duration(retry) * 500))
-			continue
-		} else {
-			stop = true
-			ws.Client = c
-		}
+	ws.clientMu.Unlock()
+	if previous != nil {
+		previous.Close()
 	}
 
+	conn, err := connect(ws.Ctx, ws.Logger, ws.conf)
+	if err != nil {
+		ws.clientMu.Lock()
+		ws.status = disconnected
+		ws.clientMu.Unlock()
+		return err
+	}
+	ws.prepareConnection(conn)
+	ws.clientMu.Lock()
+	if ws.Ctx.Err() != nil || ws.closed {
+		ws.clientMu.Unlock()
+		conn.Close()
+		return ws.Ctx.Err()
+	}
+	ws.Client = conn
 	ws.status = connected
+	ws.clientMu.Unlock()
 
 	// resubscribe after reconnect
 	ws.conf.subscribeMsg.Range(func(key, value interface{}) bool {
+		if ws.Ctx.Err() != nil {
+			return false
+		}
 		// key is channel, value is []requestHistory
 		if _, ok := value.([]requestHistory); ok {
 			for _, req := range value.([]requestHistory) {
-				if req.op == nil {
-					req.op = &SubscribeOptions{
-						IsReConnect: true,
-					}
-				} else {
-					req.op.IsReConnect = true
+				op := SubscribeOptions{IsReConnect: true}
+				if req.op != nil {
+					op.ID = req.op.ID
 				}
-				if err := ws.baseSubscribe(req.Event, req.Channel, req.Payload, req.op); err != nil {
+				if err := ws.baseSubscribe(req.Event, req.Channel, req.Payload, &op); err != nil {
 					ws.Logger.Printf("after reconnect, subscribe channel[%s] err:%s", key.(string), err.Error())
 				} else {
 					if ws.conf.ShowReconnectMsg {
@@ -259,7 +385,7 @@ func (ws *WsService) reconnect(oldConn ...*websocket.Conn) error {
 		return true
 	})
 
-	return nil
+	return ws.Ctx.Err()
 }
 
 func (ws *WsService) SetKey(key string) {
@@ -336,44 +462,37 @@ func (ws *WsService) GetConnection() *websocket.Conn {
 }
 
 func (ws *WsService) keepAlive() {
-	var timeout = 10 * time.Second
-	ticker := time.NewTicker(timeout)
-
-	lastResponse := time.Now()
-	setPongHandler := func(conn *websocket.Conn) {
-		if conn == nil {
+	interval, err := time.ParseDuration(ws.conf.PingInterval)
+	if err != nil || interval <= 0 {
+		interval = 10 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ws.Ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if ws.Ctx.Err() != nil {
 			return
 		}
-		conn.SetPongHandler(func(msg string) error {
-			lastResponse = time.Now()
-			return nil
-		})
-	}
-	setPongHandler(ws.GetConnection())
-
-	go func() {
-		defer ticker.Stop()
-		for {
-			conn := ws.GetConnection()
-			ws.mu.Lock()
-			err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second))
-			ws.mu.Unlock()
-			if err != nil {
-				ws.Logger.Printf("send ping err:%s", err.Error())
+		conn := ws.GetConnection()
+		if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+			if ws.Ctx.Err() != nil {
+				return
 			}
-			<-ticker.C
-			if time.Since(lastResponse) > 30*time.Second {
-				ws.Logger.Printf("ping timeout, should reconnect")
-				err = ws.reconnect(conn)
-				if err != nil {
-					ws.Logger.Printf("reconnect err:%s", err.Error())
-				} else {
-					setPongHandler(ws.GetConnection())
-					lastResponse = time.Now()
+			ws.Logger.Printf("send ping err:%s", err.Error())
+		}
+		if time.Since(time.Unix(0, atomic.LoadInt64(&ws.lastPong))) > 3*interval {
+			if err := ws.reconnect(conn); err != nil {
+				if ws.Ctx.Err() != nil {
+					return
 				}
+				ws.Logger.Printf("reconnect err:%s", err.Error())
 			}
 		}
-	}()
+	}
 }
 
 var statusString = map[status]string{
@@ -383,5 +502,7 @@ var statusString = map[status]string{
 }
 
 func (ws *WsService) Status() string {
+	ws.clientMu.Lock()
+	defer ws.clientMu.Unlock()
 	return statusString[ws.status]
 }
